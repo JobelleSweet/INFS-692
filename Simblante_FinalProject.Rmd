@@ -1,0 +1,510 @@
+---
+title: "Data Science Final Project"
+author: "Jobelle Sorino-Simblante"
+date: "December 16, 2022"
+output:
+  pdf_document: default
+---
+## Context
+Irrespective of whether or not data nd imaes are stored/analyzed in a centralized manner, variability in scanner models, acquisition protocols and reconstruction settings are unavoidable in the current clinical practice. Yet radiomics are notoriously sensitive to such protocol variations. Hence, there is a clear need for the harmonization of features in order to allow consistent findings in radiomics multicenter studies.
+
+## Objective
+The objective of this project is to develop different models to predic failure (endpoint) of the radiomics signature based from MRI, PET and CT scans.
+
+## Needed Packages
+These are the needed packages in this activity:
+```{r,warning=FALSE,message=FALSE}
+library(readr)
+library(dplyr)       
+library(ggplot2)     
+library(stringr)     
+library(recipes)
+library(rsample)
+library(xgboost)
+library(gbm)
+library(rpart)
+library(rpart.plot)
+library(ROCR)        
+library(pROC)        
+library(gridExtra)   
+library(tidyverse)   
+library(cluster)     
+library(factoextra)  
+library(caret)
+library(keras)         
+library(tfruns)  
+library(tensorflow)
+library(tfestimators) 
+library(mclust)
+```
+## Dataset
+
+Radiomics dataset has 431 variables with 197 observations.
+```{r,warning=FALSE,message=FALSE, echo = FALSE}
+setwd("C:/Users/jobel/OneDrive/Desktop/STT 371/FINAL_PROJECT")
+```
+
+```{r,warning=FALSE,message=FALSE}
+radiomics = read.csv("radiomics_completedata.csv",header = TRUE, sep = ",")
+attach(radiomics)
+str(radiomics)
+head(radiomics[1:5])
+```
+
+### Preprocess the data
+
+```{r,warning=FALSE,message=FALSE}
+# Check for null and missing values
+any(is.na(radiomics))
+```
+
+```{r,warning=FALSE,message=FALSE}
+# Check for normality, if not, normalized the data
+shapiro.test(Entropy_cooc.W.ADC) # Entropy_cooc.W.ADC is normally distributed
+shapiro.test(GLNU_align.H.PET)   # GLNU_align.H.PET is not normally distributed
+shapiro.test(Min_hist.PET)       # Min_hist.PET is not normally distributed
+
+# Since some of the variables are not normally distributed, then we will 
+# normalized it by using scale() function
+radiomics_df <- as.data.frame(scale(select(radiomics, -c("Institution",
+                                                         "Failure.binary" ))))
+head(radiomics_df[1:5])
+```
+
+```{r,warning=FALSE,message=FALSE}
+# Get the correlation of the whole data except the categorical variables
+cor.radiomics_df= cor(radiomics_df)
+corr = round(cor.radiomics_df,2) # 2 decimals
+head(corr[1:4 ,1:3])
+
+corMatrix =  cor(radiomics_df, y = NULL, use = "ev")
+highly_correlated_columns = findCorrelation(
+  corMatrix,
+  cutoff = 0.95, # correlation coefficient
+  verbose = FALSE,
+  names = FALSE,
+  exact = TRUE
+)
+df <- radiomics_df[, -highly_correlated_columns]
+
+# Final Radiomics Data
+final_radiomics <- cbind(radiomics['Failure.binary'], df)
+head(final_radiomics[1:4])
+final_radiomics$Failure.binary <- as.factor(final_radiomics$Failure.binary)
+str(final_radiomics)
+attach(final_radiomics)
+```
+
+### Create training (80%) and testing (20%) data.
+
+```{r,warning=FALSE,message=FALSE}
+set.seed(123)
+radio <- final_radiomics %>% mutate_if(is.ordered, factor, ordered = FALSE)
+splitdata = initial_split(radio ,prop = 0.8 ,strata = "Failure.binary")
+splitdata
+final_radiomics_train <- training(splitdata)
+head(final_radiomics_train[1:5])
+final_radiomics_test <- testing(splitdata)
+head(final_radiomics_test[1:5])
+```
+
+```{r,warning=FALSE,message=FALSE}
+prep_train <- recipe(Failure.binary~., data=final_radiomics_train) %>%
+  step_integer(all_nominal()) %>%
+  step_nzv(all_nominal()) %>%
+  step_dummy(all_nominal(), -all_outcomes(), one_hot = TRUE) %>%
+  step_center(all_numeric(), -all_outcomes()) %>%
+  step_scale(all_numeric(), -all_outcomes()) %>%
+  prep(training = final_radiomics_train, retain = TRUE) %>%
+  juice()
+
+prep_test <- recipe(Failure.binary~., data=final_radiomics_test) %>%
+  step_integer(all_nominal()) %>%
+  step_nzv(all_nominal()) %>%
+  step_dummy(all_nominal(), -all_outcomes(), one_hot = TRUE) %>%
+  step_center(all_numeric(), -all_outcomes()) %>%
+  step_scale(all_numeric(), -all_outcomes()) %>%
+  prep(testing = final_radiomics_test, retain = TRUE) %>%
+  juice()
+
+X_train<- as.matrix(prep_train[setdiff(names(prep_train), 
+                                           "Failure.binary")])
+Y_train<- prep_train$Failure.binary
+
+X_test<- as.matrix(prep_test[setdiff(names(prep_test), 
+                                         "Failure.binary")])
+Y_test<- prep_test$Failure.binary
+```
+## Model 1
+
+
+### Model 1.1: Modelling the data using XGBOOST
+
+```{r,warning=FALSE,message=FALSE}
+# optimal parameter list
+params <- list(
+  eta = 0.01,
+  max_depth = 3,
+  min_child_weight = 3,
+  subsample = 0.5,
+  colsample_bytree = 0.5
+)
+
+
+# Model of Train Data
+set.seed(123)
+xgb.fit.final <- xgboost(
+  params = params,
+  data = X_train,
+  label = Y_train-1,
+  nrounds = 4000,
+  objective = "binary:logistic",
+  verbose = 0
+)
+summary(xgb.fit.final)
+
+# Top 20 important features during Training
+vip::vip(xgb.fit.final, num_features = 20)
+
+# Prediction performance of the model using training data set
+pred_xgboost_train<- predict(xgb.fit.final, X_train, type = "prob")
+pred_xgboost_train
+perf1 <- prediction(pred_xgboost_train,final_radiomics_train$Failure.binary) %>%
+  performance(measure = "tpr", x.measure = "fpr")
+perf1
+
+# Prediction performance of the model using testing data set
+pred_xgboost_test<- predict(xgb.fit.final, X_test, type = "prob")
+pred_xgboost_test
+perf2 <- prediction(pred_xgboost_test, final_radiomics_test$Failure.binary) %>%
+  performance(measure = "tpr", x.measure = "fpr")
+perf2
+
+# Training and Testing data performance plot
+par(mfrow = c(1,2))
+
+# Training prediction performane
+roc(final_radiomics_train$Failure.binary ~ pred_xgboost_train, 
+    plot=TRUE, legacy.axes=FALSE, 
+    percent=TRUE, col="blue", lwd=2, print.auc=TRUE, 
+    main = "Performance in Training")
+
+# Testing set prediction performance
+roc(final_radiomics_test$Failure.binary ~ pred_xgboost_test, 
+    plot=TRUE, legacy.axes=FALSE, 
+    percent=TRUE, col="red", lwd=2, print.auc=TRUE, 
+    main = "Performance in Testing")
+```
+
+
+### Model 1.2: Modelling the data using GBM
+```{r,warning=FALSE,message=FALSE}
+set.seed(123)
+gbm_model <- gbm(
+  formula = Failure.binary ~ .,
+  data = final_radiomics_train,
+  distribution = "gaussian",  
+  n.trees = 500,
+  shrinkage = 0.1,
+  interaction.depth = 3,
+  n.minobsinnode = 10,
+  cv.folds = 10
+)
+
+# Top 20 important features during Training
+vip::vip(gbm_model, num_features = 20)
+
+# Prediction performance of the model using training data set
+pred_gbm_train<- predict(gbm_model, newdata=as.data.frame(X_train), 
+                         type = "response")
+pred_gbm_train
+perf3 <- prediction(pred_gbm_train,final_radiomics_train$Failure.binary) %>%
+  performance(measure = "tpr", x.measure = "fpr")
+perf3
+
+# Prediction performance of the model using testing data set
+pred_gbm_test<- predict(gbm_model, newdata=as.data.frame(X_test), 
+                        type = "response")
+pred_gbm_test
+perf4 <- prediction(pred_gbm_test, final_radiomics_test$Failure.binary) %>%
+  performance(measure = "tpr", x.measure = "fpr")
+perf4
+
+# Training and Testing data performance plot
+par(mfrow = c(1,2))
+
+# Training prediction performane
+roc(final_radiomics_train$Failure.binary ~ pred_gbm_train, 
+    plot=TRUE, legacy.axes=FALSE, 
+    percent=TRUE, col="blue", lwd=2, print.auc=TRUE, 
+    main = "Performance in Training")
+
+# Testing set prediction performance
+roc(final_radiomics_test$Failure.binary ~ pred_gbm_test, 
+    plot=TRUE, legacy.axes=FALSE, 
+    percent=TRUE, col="red", lwd=2, print.auc=TRUE, 
+    main = "Performance in Testing")
+```
+
+### Model 1.3: Modelling the data using Rpart
+```{r,warning=FALSE,message=FALSE}
+set.seed(123)
+# Modelling
+rpart_train_model <- rpart(Failure.binary~.,data=final_radiomics_train, 
+                           method="class")
+
+rpart_test_model <- rpart(Failure.binary~.,data=final_radiomics_test, 
+                           method="class")
+
+
+# Top 20 important features during Training
+vip::vip(rpart_train_model, num_features = 20)
+
+# Prediction performance of the model using training data set
+pred_rpart_train<- predict(rpart_train_model, newdata=as.data.frame(X_train), 
+                        type = "prob", na.action = na.pass)
+pred_rpart_train
+
+
+# Prediction performance of the model using testing data set
+pred_rpart_test<- predict(rpart_test_model, newdata=as.data.frame(X_test), 
+                        type = "prob", na.action = na.pass)
+pred_rpart_test
+
+# Training and Testing data performance plot
+par(mfrow = c(1,2))
+
+# Training prediction performane
+roc(final_radiomics_train$Failure.binary ~ pred_rpart_train[,2], 
+    plot=TRUE, legacy.axes=FALSE, 
+    percent=TRUE, col="blue", lwd=2, print.auc=TRUE, 
+    main = "Performance in Training")
+
+# Testing set prediction performance
+roc(final_radiomics_test$Failure.binary ~ pred_rpart_test[,2], 
+    plot=TRUE, legacy.axes=FALSE, 
+    percent=TRUE, col="red", lwd=2, print.auc=TRUE, 
+    main = "Performance in Testing")
+```
+
+## Model 2
+
+```{r,warning=FALSE,message=FALSE}
+set.seed(123)
+Train_Features <- data.matrix(final_radiomics_train[,-1])
+Train_Labels <- final_radiomics_train[,1]
+Test_Features <- data.matrix(final_radiomics_test[,-1])
+Test_Labels <- final_radiomics_test[,1]
+
+# Reshaping the dataset
+colnames(Train_Features) <- paste0("V", 1:ncol(Train_Features))
+Train_Features <- Train_Features / 255
+
+colnames(Test_Features) <- paste0("V", 1:ncol(Test_Features))
+Test_Features <- Test_Features / 255
+
+# Converting the labels into categorical
+Train_Labels <- to_categorical(Train_Labels, num_classes = 2)
+Test_Labels <- to_categorical(Test_Labels, num_classes = 2)
+
+
+# Model training
+set.seed(123)
+model <- keras_model_sequential() %>%
+  layer_dense(units = 256, activation = "sigmoid", input_shape = ncol(Train_Features)) %>%
+  layer_dropout(rate = 0.3) %>% 
+  layer_dense(units = 128, activation = "sigmoid") %>%
+  layer_dropout(rate = 0.3) %>% 
+  layer_dense(units = 128, activation = "sigmoid") %>%
+  layer_dropout(rate = 0.3) %>% 
+  layer_dense(units = 64, activation = "sigmoid") %>%
+  layer_dropout(rate = 0.3) %>% 
+  layer_dense(units = 64, activation = "sigmoid") %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 2, activation = "softmax")
+summary(model)
+
+# Backpropagation
+model %>% compile(
+  loss = "categorical_crossentropy",
+  optimizer = optimizer_rmsprop(),
+  metrics = c("accuracy")
+)
+
+# Compiling the model
+model %>% compile(
+  loss = "categorical_crossentropy",
+  optimizer = optimizer_adam(),
+  metrics = c("accuracy")
+)
+
+# Train the model 
+set.seed(123)
+model_fit <- model %>% 
+  fit(Train_Features, Train_Labels, epochs = 10, batch_size = 128, 
+      validation_split = 0.15)
+
+# Display Output
+model_fit
+plot(model_fit)
+
+# Model evaluation
+model %>%
+  evaluate(Test_Features, Test_Labels)
+
+# Model prediction
+model %>% predict(Test_Features)
+```
+
+## Model 3
+
+```{r,warning=FALSE,message=FALSE}
+# The data
+data <- radiomics_df 
+head(data[1:5])
+summary(data[1:5])
+```
+
+### Model 3.1: K-Means
+
+```{r,warning=FALSE,message=FALSE}
+# Determining Optimal Number of Clusters
+set.seed(123)
+
+# Function to compute total within-cluster sum of square 
+wss <- function(k) {
+  kmeans(data, k, nstart = 10)$tot.withinss
+}
+
+# Compute and plot wss for k = 1 to k = 15
+k.values <- 1:15
+
+# extract wss for 1-15 clusters
+wss_values <- map_dbl(k.values, wss)
+
+plot(k.values, wss_values,
+     type="b", pch = 19, frame = FALSE, 
+     xlab="Number of clusters K",
+     ylab="Total within-clusters sum of squares")
+
+# or use this
+fviz_nbclust(data, kmeans, method = "silhouette")
+
+# compute gap statistic
+set.seed(123)
+gap_stat <- clusGap(data, FUN = kmeans, nstart = 25,
+                    K.max = 10, B = 50)
+# Print the result
+print(gap_stat, method = "firstmax")
+
+fviz_gap_stat(gap_stat)
+
+# Compute k-means clustering with k = 2
+set.seed(123)
+k_means <- kmeans(data, 2, nstart = 25)
+print(k_means)
+
+
+# Plot of Final kmeans clustering
+kmeans_plot <- fviz_cluster(k_means, data = data) +
+  ggtitle("(3.1) K-Means Clustering")
+kmeans_plot
+```
+
+### Model 3.2: Hierarchical
+
+```{r,warning=FALSE,message=FALSE}
+set.seed(123)
+
+# Plot cluster results
+p1 <- fviz_nbclust(data, FUN = hcut, method = "wss", 
+                   k.max = 10) +
+  ggtitle("(A) Elbow method")
+p2 <- fviz_nbclust(data, FUN = hcut, method = "silhouette", 
+                   k.max = 10) +
+  ggtitle("(B) Silhouette method")
+p3 <- fviz_nbclust(data, FUN = hcut, method = "gap_stat", 
+                   k.max = 10) +
+  ggtitle("(C) Gap statistic")
+
+# Display plots side by side
+gridExtra::grid.arrange(p1, p2, p3, nrow = 1)
+
+# Dissimilarity matrix
+d <- dist(data, method = "euclidean")
+
+# Construct Hierarchical clustering
+hierarchical <- hclust(d, method = "ward.D2" )
+summary(hierarchical)
+
+# Cut tree into 2 groups
+sub_grp <- cutree(hierarchical, k = 2)
+
+# Number of members in each cluster
+table(sub_grp)
+
+# Plot full dendogram
+hierarchical_plot <- fviz_dend(
+  hierarchical,
+  k = 2,
+  horiz = FALSE,
+  rect = TRUE,
+  rect_fill = TRUE,
+  rect_border = "jco",
+  k_colors = "jco",
+  cex = 0.1
+) +
+  ggtitle("(3.2) Hierarchical Clustering")
+hierarchical_plot
+```
+
+### Model 3.3: Model-Based
+
+```{r,warning=FALSE,message=FALSE}
+  # Apply GMM model with 10 components
+set.seed(123)
+radiomics_mc <- Mclust(data, 1:10)
+summary(radiomics_mc)
+
+plot(radiomics_mc, what = 'BIC', 
+     legendArgs = list(x = "bottomright", ncol = 10))
+
+probabilities <- radiomics_mc$z 
+
+probabilities <- probabilities %>%
+  as.data.frame() %>%
+  mutate(id = row_number()) %>%
+  tidyr::gather(cluster, probability, -id)
+
+ggplot(probabilities, aes(probability)) +
+  geom_histogram() +
+  facet_wrap(~ cluster, nrow = 2)
+
+uncertainty <- data.frame(
+  id = 1:nrow(data),
+  cluster = radiomics_mc$classification,
+  uncertainty = radiomics_mc$uncertainty
+)
+
+uncertainty %>%
+  group_by(cluster) %>%
+  filter(uncertainty > 0.0001) %>%
+  ggplot(aes(uncertainty, reorder(id, uncertainty))) +
+  geom_point() +
+  facet_wrap(~ cluster, scales = 'free_y', nrow = 1)
+
+cluster2 <- data %>%
+  scale() %>%
+  as.data.frame() %>%
+  mutate(cluster = radiomics_mc$classification) %>%
+  filter(cluster == 2) %>%
+  select(-cluster)
+
+cluster2 %>%
+  tidyr::gather(product, std_count) %>%
+  group_by(product) %>%
+  summarize(avg = mean(std_count)) %>%
+  ggplot(aes(avg, reorder(product, avg))) +
+  geom_point() +
+  labs(x = "Average standardized consumption", y = NULL)
+```
